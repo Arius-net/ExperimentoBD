@@ -1,0 +1,117 @@
+name: benchmark
+
+# Límites cgroups v2 compartidos por ambas bases de datos (D-07, D-10).
+# memswap_limit == mem_limit => 0 swap (mem_swappiness se omite: no aplica en cgroups v2, D-12).
+x-db-limits: &db-limits
+  cpus: ${CPU_LIMIT}
+  mem_limit: ${MEM_LIMIT}
+  memswap_limit: ${MEMSWAP_LIMIT}
+  restart: "no"
+  networks: [ bench_net ]
+
+services:
+  # ---------------------------------------------------------------- MongoDB
+  mongo:
+    <<: *db-limits
+    image: ${MONGO_IMAGE}
+    profiles: [ mongo ]
+    container_name: bench_mongo
+    command:
+      - mongod
+      - --wiredTigerCacheSizeGB
+      - "${MONGO_WT_CACHE_GB}"
+      - --bind_ip_all
+    ports:
+      - "${MONGO_PORT}:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: [ "CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok" ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ------------------------------------------------------------- PostgreSQL
+  postgres:
+    <<: *db-limits
+    image: ${POSTGRES_IMAGE}
+    profiles: [ postgres ]
+    container_name: bench_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${PG_SHARED_BUFFERS}
+      - -c
+      - effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE}
+      - -c
+      - work_mem=${PG_WORK_MEM}
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}" ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # -------------------------------------------------------------- Telemetría
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: bench_cadvisor
+    privileged: true
+    command:
+      - --housekeeping_interval=1s
+      - --allow_dynamic_housekeeping=false
+      - --docker_only=true
+    ports:
+      - "${CADVISOR_PORT}:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    devices:
+      - /dev/kmsg
+    networks: [ bench_net ]
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: bench_node_exporter
+    pid: host
+    command:
+      - --path.rootfs=/host
+    ports:
+      - "${NODE_EXPORTER_PORT}:9100"
+    volumes:
+      - /:/host:ro
+    networks: [ bench_net ]
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: bench_prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+    ports:
+      - "${PROMETHEUS_PORT}:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks: [ bench_net ]
+    depends_on: [ cadvisor, node-exporter ]
+
+networks:
+  bench_net:
+    name: bench_net
+
+volumes:
+  mongo_data:
+  pg_data:
+  prometheus_data:
