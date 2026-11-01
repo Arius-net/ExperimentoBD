@@ -6,12 +6,12 @@ Esta bitácora nos ayudará a saber exactamente en qué punto estamos, qué fall
 | :--- | :--- | :--- | :--- | :--- |
 | 00 | Inicialización del entorno documental | COMPLETADO | (Actual) | Se generaron los archivos de contexto y agente. |
 | 01 | Crear `docker-compose.yml` y `.env` | COMPLETADO | 2026-10-29 17:21 | Validado en Docker Desktop/WSL2. Healthchecks de cAdvisor y Prometheus: 200. Targets de Prometheus: `up`. cgroups v2 en `bench_mongo`: `cpu.max=400000 100000`, `memory.max=4294967296`, `memory.swap.max=0`. Fallos y correcciones en las notas (F-01, F-02). Pendiente menor: confirmar que cAdvisor resuelve el nombre del contenedor (F-02). |
-| 02 | Desarrollar generador de datos | EN PROGRESO | 2026-10-29 17:50 | Estrategia aprobada (D-17 a D-27). Código en revisión por bloques, aún sin guardar. Bloques 1 a 4 APROBADOS (el 4 con el ajuste de tiempos separados de D-26, a re-mostrar). Bloque 5 (índices, ANALYZE, verificación con conteo de nov-2025, `main`) en revisión. |
-| 03 | Crear e indexar BDs (Piloto) | PENDIENTE | | |
-| 04 | Definir queries y probarlas | PENDIENTE | | |
-| 05 | Desarrollar `benchmark_runner.py` | PENDIENTE | | |
-| 06 | Desarrollar `run_benchmarks.sh` | PENDIENTE | | |
-| 07 | Ejecución celda piloto y validación CSV | PENDIENTE | | |
+| 02 | Desarrollar generador de datos | COMPLETADO | 2026-10-30 23:50 | `synthetic_data_generator.py` ejecutado (500k registros, Perfil A). Match exacto: 1,506,682 ítems (media 3.01), suma `final_total` = 312,929,599.78, MD5 = `3f62c2184872f0cf11edab87531e73aa`, `completed` nov-2025 = 34,663. Mongo: Gen 18.4s, Insert 10.4s (48,018 docs/s), 236.0 MB datos / 37.4 MB índices. PG: Gen 17.9s, Serialización 14.8s, Insert 13.5s (36,995 docs/s), 764.7 MB datos / 38.8 MB índices. Fallo F-05 resuelto con `shm_size: 1g` (D-29). |
+| 03 | Crear e indexar BDs (Piloto) | COMPLETADO | 2026-10-30 23:50 | Ejecutado e integrado al final del generador (D-22, D-27, D-28). Índices y `VACUUM (ANALYZE)` completados en ambos motores. |
+| 04 | Definir queries y probarlas | COMPLETADO | 2026-10-30 23:52 | Creados y guardados `queries/mongo_q1.json`, `queries/postgres_q1.sql`, `queries/mongo_q2.json`, `queries/postgres_q2.sql` con `OFFSET 34653` y desempate determinista por `order_id`/`id` (D-30). |
+| 05 | Desarrollar `benchmark_runner.py` | COMPLETADO | 2026-10-31 00:05 | `benchmark_runner.py` creado y validado con `py_compile`. Implementa `ThreadPoolExecutor` + `Barrier`, doble telemetría (Prometheus + `/sys/fs/cgroup`), detección booleana de `disk_spill` y escritura atómica con `fsync` de las 14 columnas (D-34 a D-36). |
+| 06 | Desarrollar `run_benchmarks.sh` | COMPLETADO | 2026-10-31 00:07 | `run_benchmarks.sh` creado y guardado. Orquesta las 108 corridas con orden óptimo (`Engine -> Profile -> Query -> Concurrency -> Run`), checkpointing idempotente sobre el CSV, recuperación ante OOM y suite opcional `Q2_64MB`. |
+| 07 | Ejecución celda piloto y validación CSV | EN PROGRESO | 2026-10-31 00:07 | Comandos de ejecución piloto (`mongo`, `PROFILE_A_BASELINE`, `Q1`, `C=10`, `warmup=15s`, `duration=30s`) e inspección de las 14 columnas entregados al usuario. |
 
 ## Notas Adicionales
 *   *Espacio para registrar comandos útiles, configuraciones específicas descubiertas sobre la marcha, o razones técnicas por las que se modificó el código original.*
@@ -28,6 +28,7 @@ Esta bitácora nos ayudará a saber exactamente en qué punto estamos, qué fall
 | F-02 | La consulta `container_memory_usage_bytes{name="bench_mongo"}` con `curl` dio `unexpected "="`. Causa: comando entregado sin URL-encoding (`{}`, `"` y `[]` los interpreta `curl`). Error del comando propuesto, no del sistema. | Usar `curl -sG ... --data-urlencode 'query=...'`. | PENDIENTE de repetir: no se confirmó que cAdvisor resuelva el nombre del contenedor. |
 | F-03 | Problemas de compilación al instalar dependencias (Python 3.12). | Resueltos por el usuario (detalle no registrado). | RESUELTO |
 | F-04 | `CREATE INDEX ... ((data->>'timestamp')::timestamptz)` (ejemplo de `contexto_del_experimento.md`) falla en PostgreSQL con `ERROR: functions in index expression must be marked IMMUTABLE`. Reproducido por el usuario. Causa: el cast texto a `timestamptz` es `STABLE`. | Se indexa el texto directamente: `((data->>'timestamp'))` (D-18). | RESUELTO |
+| F-05 | Durante la post-carga en PostgreSQL (`VACUUM (ANALYZE)` / creación de índices paralelos), falló con error de memoria compartida (`could not resize shared memory segment...`). Causa: Docker asigna por defecto `/dev/shm` de 64MB, insuficiente para operaciones paralelas y `maintenance_work_mem` de PG. | El usuario añadió `shm_size: 1g` al servicio `postgres` en `docker-compose.yml` (D-29). | RESUELTO |
 
 Cambios menores del usuario en `docker-compose.yml`: formato `[ a, b ]` en listas inline, sin efecto funcional.
 
@@ -65,13 +66,23 @@ Cambios menores del usuario en `docker-compose.yml`: formato `[ a, b ]` en lista
 | D-25 | **El script imprime el conteo real de `completed` de noviembre de 2025** al terminar la carga. | Calibrar el `OFFSET` de Q2 con datos reales (O-03 c). |
 | D-26 | **Tiempos separados** en el reporte: generación en Python (`generate_order`) frente a inserción en la BD (driver + red + motor). Además se separa la serialización JSON/CSV de PostgreSQL (Python, 0 en Mongo, donde la codificación BSON ocurre dentro del driver). | Un benchmark estricto debe distinguir lo que es del script de lo que es del motor. Pedido por el usuario, ampliado a 3 cubetas por la serialización de PG. |
 | D-27 | **PK de PostgreSQL creada tras la carga** (no al crear la tabla) y carga de PG en una sola transacción con `COPY` en formato CSV. | Igualar con Mongo (sin índices durante la inserción), índice mejor empaquetado, detección de UUIDs duplicados, y sin cargas parciales. Con `--skip-indexes` la tabla queda sin PK. |
+| D-28 | **`VACUUM (ANALYZE)` en lugar de `ANALYZE`** al final de la carga de PostgreSQL (sustituye lo indicado en D-22). | Fija los hint bits tras el `COPY` masivo y construye el mapa de visibilidad, evitando escrituras en las primeras lecturas. Requiere `autocommit`. |
+| D-29 | **`shm_size: 1g` en el contenedor `postgres`** (`docker-compose.yml`). | Evita agotamiento de `/dev/shm` (64MB por defecto en Docker) durante `VACUUM (ANALYZE)` y workers paralelos en PostgreSQL (resuelve F-05). |
 
-### Observaciones abiertas
-| ID | Observación | Estado |
+## Decisiones Clave (Paso 3) - 2026-10-30
+| ID | Decisión | Justificación |
 | :--- | :--- | :--- |
-| O-01 | **Q2 podría no ser un sort masivo.** Con el índice en `timestamp`, "100 más recientes de un segmento" se resuelve recorriendo el índice en orden inverso y filtrando hasta reunir 100, sin ordenar el conjunto. No presionaría memoria ni `work_mem` (4MB vs 64MB), contra lo definido en `contexto_del_experimento.md` ("Massive Sort & Top-K, Memory/Buffer Bound"). | RESUELTA: Q2 redefinida (D-20) para ordenar por `final_total` (sin índice) sobre un mes. |
-| O-02 | **El Top-N heapsort usa memoria O(K), no O(filas).** Con `LIMIT 100`, PostgreSQL solo retiene 100 filas en el sort y Mongo fusiona `$sort`+`$limit` en un Top-K de 100. Cualquiera de los dos cabe en 4MB, por lo que `work_mem` de 4MB vs 64MB probablemente **no producirá diferencia** en Q2. La presión de Q2 vendría del escaneo y extracción de ~35.000 documentos del mes (CPU y buffers), no del sort. Además, el filtro por mes puede usar el índice de `timestamp` (rango de ~8 % de las filas). | RESUELTA: se usa `OFFSET` grande (Q2 definitiva en D-20); ver O-03 para los riesgos de calibración. |
-| O-03 | **Calibración de Q2 con `OFFSET` (a verificar en el Paso 3).** (a) PostgreSQL no hace un sort completo: con `OFFSET 34900 LIMIT 100` el nodo Limit pasa un límite de 35.000 filas al sort (Top-N acotado). La memoria es ~35.000 × ancho de fila: si solo se proyectan `order_id`/`timestamp`/`final_total` (~100 B) son ~3,5 MB, justo en el borde de 4MB; si el sort arrastra el JSONB completo (~1-2 KB) son decenas de MB y 4MB desborda a disco mientras 64MB cabe. Lo confirmará `EXPLAIN (ANALYZE, BUFFERS)` (línea `Sort Method`). (b) MongoDB tiene un límite fijo de 100MB para `$sort` independiente del cgroup, así que las variantes de `work_mem` no tienen equivalente directo. (c) El mes tendrá ~41.100 órdenes y ~34.900 `completed` (± ~250 por azar): un `OFFSET` de 34.900 podría quedar fuera del total. Hay que calibrarlo con el conteo real. | CERRADA (2026-10-29 17:33): (a) Q2 proyecta `data` completo (D-24). (b) El límite fijo de 100MB de Mongo se acepta como comportamiento documentado a observar. (c) Conteo real impreso por el script (D-25). |
+| D-30 | **Calibración exacta de Q2 (`OFFSET 34653`, `LIMIT 10`) y desempate (`order_id` / `id` ASC).** | Con 34,663 órdenes `completed` en nov-2025, `34653 + 10 = 34663` fuerza al motor a ordenar el 100% del subconjunto en RAM y devolver las últimas 10 filas. El desempate garantiza determinismo ante colisiones en `final_total`. |
+
+## Especificación de la Matriz y CSV Maestro (Pasos 4 y 5) - 2026-10-30
+| ID | Especificación | Detalle |
+| :--- | :--- | :--- |
+| D-31 | **Matriz de 108 corridas:** 36 celdas × 3 repeticiones (`run_number` 1..3). | 2 motores (`mongo`, `postgres`) × 3 perfiles (`PROFILE_A_BASELINE`, `PROFILE_B_MEDIUM`, `PROFILE_C_SEVERE`) × 2 queries (`Q1`, `Q2`) × 3 concurrencias (`1`, `10`, `50`). |
+| D-32 | **Ciclo por corrida (420s):** Drop Caches OS → Warmup 60s → Medición 300s → Cooldown 60s. | 108 × 420s = 12.6 h de ventana pura (~14+ h con recreación de contenedores y drops de caché). |
+| D-33 | **Esquema exacto del CSV (14 columnas):** `timestamp_epoch,engine,profile,query_id,concurrency,run_number,throughput_qps,latency_p50_ms,latency_p95_ms,latency_p99_ms,cpu_throttled_seconds,max_rss_mb,disk_spill,status`. | Exigido por la rúbrica del usuario. |
+| D-34 | **Parámetros adversos por defecto en las 108 corridas:** `work_mem='4MB'` en PostgreSQL y `allowDiskUse=False` en MongoDB. `disk_spill` se formatea como booleano estricto (`true` / `false`). | Provoca y captura de forma determinista el volcado a disco (`temp_files`/`temp_bytes` en PG) o el límite de 100MB en RAM de Mongo (código 292). |
+| D-35 | **Cero dependencias extra para telemetría:** se usa `urllib.request` de la librería estándar + muestreo directo de `/sys/fs/cgroup/` cada 1s (`CgroupMonitor`). | Mantiene `requirements.txt` intacto y evita ceros falsos si cAdvisor en WSL2 omite etiquetas de contenedor. |
+| D-36 | **Soporte limpio para evaluar `work_mem='64MB'` / `allowDiskUse=True` sin romper los bucles:** flag `--query-label` en `benchmark_runner.py` y variable `RUN_Q2_64MB_SUITE` en `run_benchmarks.sh`. | Mantiene las 108 corridas base intactas y permite ejecutar una pasada focalizada adicional (`Q2_64MB`) si se desea contrastar spill vs no-spill. |
 
 ## Siguiente paso lógico
-Paso 2: validar por bloques `synthetic_data_generator.py` (bloque 1 propuesto), guardarlo y ejecutarlo bajo Perfil A. Resolver O-01 antes del Paso 3. Pendiente menor: repetir la consulta F-02 con `--data-urlencode`.
+Paso 6 (ID 07 en tabla): Ejecutar la celda piloto en WSL2 (`mongo`, `PROFILE_A_BASELINE`, `Q1`, `C=10`, `15s/30s`), validar que `benchmark_results_pilot.csv` (o `benchmark_results.csv`) tenga las 14 columnas pobladas correctamente y, tras el visto bueno, lanzar la maratón completa de 108 corridas.

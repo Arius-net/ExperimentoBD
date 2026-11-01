@@ -35,6 +35,7 @@ services:
   postgres:
     <<: *db-limits
     image: ${POSTGRES_IMAGE}
+    shm_size: 1g
     profiles: [ postgres ]
     container_name: bench_postgres
     environment:

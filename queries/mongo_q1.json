@@ -1,0 +1,31 @@
+[
+  {
+    "$match": {
+      "payment.status": "completed"
+    }
+  },
+  {
+    "$unwind": "$items"
+  },
+  {
+    "$group": {
+      "_id": "$items.category",
+      "total_qty": { "$sum": "$items.qty" },
+      "total_revenue": {
+        "$sum": { "$multiply": [ "$items.qty", "$items.price" ] }
+      }
+    }
+  },
+  {
+    "$project": {
+      "_id": 0,
+      "category": "$_id",
+      "total_qty": 1,
+      "total_revenue": { "$round": [ "$total_revenue", 2 ] }
+    }
+  },
+  {
+    "$sort": { "category": 1 }
+  }
+]
+
